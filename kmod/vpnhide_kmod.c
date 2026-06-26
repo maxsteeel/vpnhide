@@ -4,7 +4,7 @@
  * selected Android apps by filtering ioctl, netlink, and procfs
  * responses based on the calling process's UID.
  *
- * Uses kretprobes so no modification of the running kernel is needed;
+ * Uses kprobes so no modification of the running kernel is needed;
  * works on stock Android GKI kernels with CONFIG_KPROBES=y.
  *
  * Hooks:
@@ -21,9 +21,6 @@
  *
  * Target UIDs are written to /proc/vpnhide_targets from userspace.
  *
- * Architecture: arm64 only. The handlers read syscall arguments via
- * `regs->regs[N]` (AAPCS64 calling convention). On other architectures
- * those slots have a different meaning, so the build is gated below.
  */
 
 #include <linux/module.h>
@@ -53,26 +50,8 @@
 
 #include "generated/iface_lists.h"
 
-#ifndef CONFIG_ARM64
-#error "vpnhide_kmod currently supports only arm64 (handlers read regs->regs[N] directly)"
-#endif
-
 #define MODNAME "vpnhide"
 #define MAX_TARGET_UIDS 64
-
-/*
- * Pre-allocated kretprobe instance pool size, applied to every probe.
- * Default kernel `register_kretprobe` falls back to NR_CPUS*2 (≈ 18 on
- * a 9-core Pixel 8 Pro), which is too low for hot ioctl/netlink paths
- * under multi-app concurrency — exhausted pool causes silent
- * `nmissed++` and the return handler skipped, which surfaces as a VPN
- * iface leaking through a single probe call.
- *
- * 64 covers a comfortable working set (apps × threads doing
- * getifaddrs/SIOCGIFCONF/route reads at once) without burning
- * meaningful memory: 6 probes × 64 instances × ~80 B ≈ 30 KB total.
- */
-#define VPNHIDE_KRETPROBE_MAXACTIVE 64
 
 /* ------------------------------------------------------------------ */
 /*  Debug logging — toggled via /proc/vpnhide_debug                   */
@@ -237,6 +216,152 @@ static const struct proc_ops debug_proc_ops = {
 	.proc_release = single_release,
 };
 
+/* ========================================================================= */
+/* ROUTE NETLINK HELPERS                                                     */
+/* ========================================================================= */
+
+static bool copy_dev_name(struct net_device *dev, char name[IFNAMSIZ])
+{
+    if (!dev) return false;
+    if (copy_from_kernel_nofault(name, dev->name, IFNAMSIZ) != 0) return false;
+    name[IFNAMSIZ - 1] = '\0';
+    return true;
+}
+
+static bool is_physical_ifname(const char *name)
+{
+    return vpnhide_iface_starts_with_ci(name, "rmnet") ||
+           vpnhide_iface_starts_with_ci(name, "wlan") ||
+           vpnhide_iface_starts_with_ci(name, "eth") ||
+           vpnhide_iface_starts_with_ci(name, "ccmni") ||
+           vpnhide_iface_starts_with_ci(name, "ccemni") ||
+           vpnhide_iface_starts_with_ci(name, "seth");
+}
+
+static bool is_public_ipv4(__be32 addr)
+{
+    u32 host = be32_to_cpu(addr);
+    u8 a = (host >> 24) & 0xff;
+    u8 b = (host >> 16) & 0xff;
+    u8 c = (host >> 8) & 0xff;
+
+    if (a == 0 || a == 10 || a == 127 || a >= 224) return false;
+    if (a == 100 && b >= 64 && b <= 127) return false;
+    if (a == 169 && b == 254) return false;
+    if (a == 172 && b >= 16 && b <= 31) return false;
+    if (a == 192 && b == 168) return false;
+    if (a == 192 && b == 0 && c == 0) return false;
+    if (a == 192 && b == 0 && c == 2) return false;
+    if (a == 198 && (b == 18 || b == 19)) return false;
+    if (a == 198 && b == 51 && c == 100) return false;
+    if (a == 203 && b == 0 && c == 113) return false;
+    return true;
+}
+
+static bool is_public_host_route_via_physical(const struct fib_rt_info *fri, struct net_device *dev)
+{
+    char name[IFNAMSIZ];
+    if (!fri || !dev || fri->dst_len != 32 || !is_public_ipv4(fri->dst)) return false;
+    if (!copy_dev_name(dev, name)) return false;
+    return is_physical_ifname(name);
+}
+
+static bool is_public_ipv6(const struct in6_addr *addr)
+{
+    u8 b0 = addr->s6_addr[0];
+    /* Global unicast 2000::/3 only. Excludes ::/:: 1 (unspec/loopback),
+		 * fe80::/10 (link-local), fc00::/7 (ULA), ff00::/8 (multicast). */
+    if ((b0 & 0xe0) != 0x20)
+			return false;
+		/* 2001:db8::/32 documentation range. */
+    if (addr->s6_addr[0] == 0x20 && addr->s6_addr[1] == 0x01 &&
+        addr->s6_addr[2] == 0x0d && addr->s6_addr[3] == 0xb8)
+			return false;
+    return true;
+}
+
+/* IPv6 analogue of is_public_host_route_via_physical: a /128 route to a
+ * public address pinned to a physical interface is the host-route a VPN
+ * client installs so tunnel packets can reach the server — it leaks the
+ * server's IPv6 even when the tun interface itself is hidden. fib6_dst
+ * (struct rt6key { struct in6_addr addr; int plen; }) is stable across
+ * GKI 5.10..6.12; read it fault-safe since `rt` comes from a raw reg. */
+static bool is_public_host_route6_via_physical(struct fib6_info *rt, struct net_device *dev)
+{
+    struct in6_addr addr;
+    int plen = 0;
+    char name[IFNAMSIZ];
+
+    if (!rt || !dev) return false;
+    if (copy_from_kernel_nofault(&plen, &rt->fib6_dst.plen, sizeof(plen)) != 0 || plen != 128) return false;
+    if (copy_from_kernel_nofault(&addr, &rt->fib6_dst.addr, sizeof(addr)) != 0 || !is_public_ipv6(&addr)) return false;
+    if (!copy_dev_name(dev, name)) return false;
+    return is_physical_ifname(name);
+}
+
+static struct net_device *dev_from_nexthop(struct nexthop *nh)
+{
+    struct net_device *dev = NULL;
+    bool is_group = false;
+
+    if (!nh) return NULL;
+    if (copy_from_kernel_nofault(&is_group, &nh->is_group, sizeof(is_group)) != 0) return NULL;
+
+    if (is_group) {
+        struct nh_group *nh_grp = NULL;
+        struct nexthop *first_nh = NULL;
+        u16 num_nh = 0;
+
+        if (copy_from_kernel_nofault(&nh_grp, &nh->nh_grp, sizeof(nh_grp)) != 0 || !nh_grp) return NULL;
+        if (copy_from_kernel_nofault(&num_nh, &nh_grp->num_nh, sizeof(num_nh)) != 0 || num_nh == 0) return NULL;
+        if (copy_from_kernel_nofault(&first_nh, &nh_grp->nh_entries[0].nh, sizeof(first_nh)) != 0 || !first_nh) return NULL;
+        nh = first_nh;
+    }
+
+    {
+        struct nh_info *nhi = NULL;
+        if (copy_from_kernel_nofault(&nhi, &nh->nh_info, sizeof(nhi)) == 0 && nhi) {
+            copy_from_kernel_nofault(&dev, &nhi->fib_nhc.nhc_dev, sizeof(dev));
+        }
+    }
+    return dev;
+}
+
+static struct net_device *dev_from_fib_info(struct fib_info *fi)
+{
+    struct net_device *dev = NULL;
+    struct nexthop *nh = NULL;
+
+    if (!fi) return NULL;
+    if (copy_from_kernel_nofault(&nh, &fi->nh, sizeof(nh)) == 0 && nh) {
+        dev = dev_from_nexthop(nh);
+    } else {
+        int fib_nhs = 0;
+        if (copy_from_kernel_nofault(&fib_nhs, &fi->fib_nhs, sizeof(fib_nhs)) == 0 && fib_nhs > 0) {
+            copy_from_kernel_nofault(&dev, &fi->fib_nh[0].nh_common.nhc_dev, sizeof(dev));
+        }
+    }
+    return dev;
+}
+
+static struct net_device *dev_from_fib6_info(struct fib6_info *rt)
+{
+    struct net_device *dev = NULL;
+    struct nexthop *nh = NULL;
+
+    if (!rt) return NULL;
+    if (copy_from_kernel_nofault(&nh, &rt->nh, sizeof(nh)) == 0 && nh) {
+        dev = dev_from_nexthop(nh);
+    } else {
+        copy_from_kernel_nofault(&dev, &rt->fib6_nh[0].nh_common.nhc_dev, sizeof(dev));
+    }
+    return dev;
+}
+
+/* ========================================================================= */
+/* HOOK IMPLEMENTATIONS                                                      */
+/* ========================================================================= */
+
 /* ================================================================== */
 /*  Hook 1: dev_ioctl — all per-interface ioctls                      */
 /*                                                                    */
@@ -255,61 +380,25 @@ static const struct proc_ops debug_proc_ops = {
 /*  through dev_ioctl, so it is not covered here.                    */
 /* ================================================================== */
 
-struct dev_ioctl_data {
-	unsigned int cmd;
-	struct ifreq *kifr; /* kernel pointer, saved from x2 */
-	bool active; /* true = caller is target UID, run ret handler */
-};
+typedef int (*dev_ioctl_t)(struct net *net, unsigned int cmd, struct ifreq *ifr, void __user *data, bool *need_copyout);
+static dev_ioctl_t orig_dev_ioctl;
 
-static int dev_ioctl_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct dev_ioctl_data *data = (void *)ri->data;
+static int hook_dev_ioctl(struct net *net, unsigned int cmd, struct ifreq *ifr, void __user *data, bool *need_copyout) {
+    int ret = orig_dev_ioctl(net, cmd, ifr, data, need_copyout);
 
-	data->cmd = (unsigned int)regs->regs[1];
-	data->kifr = (struct ifreq *)regs->regs[2];
-	data->active = is_target_uid();
-
-	vpnhide_dbg("dev_ioctl_entry: uid=%u target=%d cmd=0x%x\n",
-		    from_kuid(&init_user_ns, current_uid()), data->active,
-		    data->cmd);
-	return 0;
+    if (ret == 0 && is_target_uid() && ifr) {
+        char name[IFNAMSIZ];
+        /* ifr is a kernel pointer here, safe to copy_from_kernel_nofault */
+        if (copy_from_kernel_nofault(name, ifr->ifr_name, IFNAMSIZ) == 0) {
+            name[IFNAMSIZ - 1] = '\0';
+            if (is_vpn_ifname(name)) {
+                vpnhide_dbg("dev_ioctl: hiding iface=%s cmd=0x%x\n", name, cmd);
+                return -ENODEV;
+            }
+        }
+    }
+    return ret;
 }
-
-static int dev_ioctl_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct dev_ioctl_data *data = (void *)ri->data;
-	char name[IFNAMSIZ];
-
-	if (!data->active || regs_return_value(regs) != 0)
-		return 0;
-
-	/*
-	 * ifr (x2) is a KERNEL pointer — the caller already did
-	 * copy_from_user into a stack-local ifreq. Read via direct
-	 * dereference; copy_from_user would EFAULT under ARM64 PAN.
-	 */
-	if (!data->kifr)
-		return 0;
-
-	memcpy(name, data->kifr->ifr_name, IFNAMSIZ);
-	name[IFNAMSIZ - 1] = '\0';
-
-	if (is_vpn_ifname(name)) {
-		vpnhide_dbg("dev_ioctl_ret: hiding iface=%s cmd=0x%x\n", name,
-			    data->cmd);
-		regs_set_return_value(regs, -ENODEV);
-	}
-
-	return 0;
-}
-
-static struct kretprobe dev_ioctl_krp = {
-	.handler = dev_ioctl_ret,
-	.entry_handler = dev_ioctl_entry,
-	.data_size = sizeof(struct dev_ioctl_data),
-	.maxactive = VPNHIDE_KRETPROBE_MAXACTIVE,
-	.kp.symbol_name = "dev_ioctl",
-};
 
 /* ================================================================== */
 /*  Hook 2: sock_ioctl — SIOCGIFCONF interface enumeration            */
@@ -336,149 +425,73 @@ static struct kretprobe dev_ioctl_krp = {
 /*     ifc_len) is already in userspace — we filter it uniformly via  */
 /*     copy_from_user/copy_to_user regardless of kernel version.      */
 /*                                                                    */
-/*  sock_ioctl(struct file *file, unsigned int cmd, unsigned long arg) */
-/*  arm64: x0=file, x1=cmd, x2=arg (__user ptr)                      */
-/*                                                                    */
-/*  Performance: entry handler checks cmd == SIOCGIFCONF first (one   */
-/*  compare), then is_target_uid(). For all other ioctls, overhead    */
-/*  is a single branch. SIOCGIFCONF is rare (once per getifaddrs).    */
 /* ================================================================== */
 
-struct sock_ioctl_data {
-	void __user *argp;
-	bool target;
-};
+typedef int (*sock_ioctl_t)(struct file *file, unsigned int cmd, unsigned long arg);
+static sock_ioctl_t orig_sock_ioctl;
 
-static int sock_ioctl_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct sock_ioctl_data *data = (void *)ri->data;
-	unsigned int cmd = (unsigned int)regs->regs[1];
-
-	data->target = false;
-
-	if (cmd != SIOCGIFCONF)
-		return 0;
-	if (!is_target_uid())
-		return 0;
-
-	data->target = true;
-	data->argp = (void __user *)regs->regs[2];
-	vpnhide_dbg("sock_ioctl_entry: uid=%u SIOCGIFCONF argp=%px\n",
-		    from_kuid(&init_user_ns, current_uid()), data->argp);
-	return 0;
-}
-
-/*
- * Why user-memory access is OK here:
- *
- * `sock_ioctl_ret` runs as a kretprobe return handler — same process
- * context that issued the SIOCGIFCONF syscall, kernel mode, original
- * task is still mapped and addressable. copy_from_user/copy_to_user
- * are safe in this context (it's the same userspace the original
- * sock_ioctl handler accessed). PAN/uaccess primitives are honoured.
- *
- * Faults are handled cleanly: if the user buffer was unmapped or
- * raced, the copy fails with -EFAULT and we report COPY_FAULT to the
- * caller, who skips the ifc_len rewrite to avoid a half-filtered
- * array (`buffer compacted, length unchanged`) escaping to userspace.
- */
 enum filter_ifconf_result {
-	FILTER_IFCONF_NO_CHANGE,
-	FILTER_IFCONF_CHANGED,
-	FILTER_IFCONF_COPY_FAULT,
+    FILTER_IFCONF_NO_CHANGE,
+    FILTER_IFCONF_CHANGED,
+    FILTER_IFCONF_COPY_FAULT,
 };
 
 /* Compact VPN entries out of the userspace ifreq array. The caller is
  * responsible for updating `ifc_len` only on FILTER_IFCONF_CHANGED. */
-static enum filter_ifconf_result filter_ifconf_buf(struct ifreq __user *usr_ifr,
-						   int n, int *out_len)
-{
-	struct ifreq tmp;
-	int i, dst = 0;
+static enum filter_ifconf_result filter_ifconf_buf(struct ifreq __user *usr_ifr, int n, int *out_len) {
+    struct ifreq tmp;
+    int i, dst = 0;
 
-	for (i = 0; i < n; i++) {
-		if (copy_from_user(&tmp, &usr_ifr[i], sizeof(tmp)))
-			return FILTER_IFCONF_COPY_FAULT;
-		tmp.ifr_name[IFNAMSIZ - 1] = '\0';
-		if (is_vpn_ifname(tmp.ifr_name))
-			continue;
-		if (dst != i) {
-			if (copy_to_user(&usr_ifr[dst], &tmp, sizeof(tmp)))
-				return FILTER_IFCONF_COPY_FAULT;
-		}
-		dst++;
-	}
+    for (i = 0; i < n; i++) {
+        if (copy_from_user(&tmp, &usr_ifr[i], sizeof(tmp))) return FILTER_IFCONF_COPY_FAULT;
+        tmp.ifr_name[IFNAMSIZ - 1] = '\0';
+        if (is_vpn_ifname(tmp.ifr_name)) continue;
+        if (dst != i) {
+            if (copy_to_user(&usr_ifr[dst], &tmp, sizeof(tmp))) return FILTER_IFCONF_COPY_FAULT;
+        }
+        dst++;
+    }
 
-	if (dst == n)
-		return FILTER_IFCONF_NO_CHANGE;
-	*out_len = dst * (int)sizeof(struct ifreq);
-	return FILTER_IFCONF_CHANGED;
+    if (dst == n) return FILTER_IFCONF_NO_CHANGE;
+    *out_len = dst * (int)sizeof(struct ifreq);
+    return FILTER_IFCONF_CHANGED;
 }
 
-static int sock_ioctl_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct sock_ioctl_data *data = (void *)ri->data;
-	struct ifconf __user *uifc;
-	struct ifconf ifc;
-	int orig_len;
-	enum filter_ifconf_result res;
+static int hook_sock_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    int ret = orig_sock_ioctl(file, cmd, arg);
 
-	if (!data->target)
-		return 0;
+    if (ret == 0 && cmd == SIOCGIFCONF && arg && is_target_uid()) {
+        struct ifconf __user *uifc = (struct ifconf __user *)arg;
+        struct ifconf ifc;
+        enum filter_ifconf_result res;
 
-	vpnhide_dbg("sock_ioctl_ret: retval=%ld argp=%px\n",
-		    regs_return_value(regs), data->argp);
+        if (copy_from_user(&ifc, uifc, sizeof(ifc)) == 0 && ifc.ifc_req && ifc.ifc_len > 0) {
+            int orig_len = ifc.ifc_len;
 
-	if (regs_return_value(regs) != 0 || !data->argp)
-		return 0;
+            res = filter_ifconf_buf(ifc.ifc_req, ifc.ifc_len / (int)sizeof(struct ifreq), &ifc.ifc_len);
 
-	uifc = data->argp;
-	if (copy_from_user(&ifc, uifc, sizeof(ifc)))
-		return 0;
-	if (!ifc.ifc_req || ifc.ifc_len <= 0)
-		return 0;
-
-	orig_len = ifc.ifc_len;
-	res = filter_ifconf_buf(ifc.ifc_req,
-				ifc.ifc_len / (int)sizeof(struct ifreq),
-				&ifc.ifc_len);
-
-	if (res == FILTER_IFCONF_COPY_FAULT) {
-		/*
-		 * Partial copy failure — buffer may already be
-		 * half-rewritten. Don't update ifc_len: a shorter
-		 * length on a partially-compacted buffer hides VPN
-		 * entries past the truncation but lets earlier ones
-		 * through, which is worse than just leaving
-		 * everything visible. Userspace sees the original
-		 * length and the (mostly-original) buffer.
-		 */
-		vpnhide_dbg(
-			"ifconf: copy fault during filter; ifc_len untouched\n");
-		return 0;
-	}
-
-	if (res == FILTER_IFCONF_CHANGED) {
-		if (put_user(ifc.ifc_len, &uifc->ifc_len)) {
-			vpnhide_dbg(
-				"ifconf: put_user(ifc_len=%d) failed; userspace will see compacted buffer with stale length\n",
-				ifc.ifc_len);
-			return 0;
-		}
-		vpnhide_dbg("ifconf filtered %d -> %d bytes\n", orig_len,
-			    ifc.ifc_len);
-	}
-
-	return 0;
+            if (res == FILTER_IFCONF_COPY_FAULT) {
+							/*
+								* Partial copy failure — buffer may already be
+								* half-rewritten. Don't update ifc_len: a shorter
+								* length on a partially-compacted buffer hides VPN
+								* entries past the truncation but lets earlier ones
+								* through, which is worse than just leaving
+								* everything visible. Userspace sees the original
+								* length and the (mostly-original) buffer.
+								*/
+                vpnhide_dbg("ifconf: copy fault during filter; ifc_len untouched\n");
+            } else if (res == FILTER_IFCONF_CHANGED) {
+                if (put_user(ifc.ifc_len, &uifc->ifc_len)) {
+                    vpnhide_dbg("ifconf: put_user(ifc_len=%d) failed\n", ifc.ifc_len);
+                } else {
+                    vpnhide_dbg("sock_ioctl: ifconf filtered %d -> %d bytes\n", orig_len, ifc.ifc_len);
+                }
+            }
+        }
+    }
+    return ret;
 }
-
-static struct kretprobe sock_ioctl_krp = {
-	.handler = sock_ioctl_ret,
-	.entry_handler = sock_ioctl_entry,
-	.data_size = sizeof(struct sock_ioctl_data),
-	.maxactive = VPNHIDE_KRETPROBE_MAXACTIVE,
-	.kp.symbol_name = "sock_ioctl",
-};
 
 /* ================================================================== */
 /*  Hook 3: rtnl_fill_ifinfo — netlink RTM_NEWLINK (getifaddrs path)  */
@@ -492,82 +505,36 @@ static struct kretprobe sock_ioctl_krp = {
 /*  the same skb_trim approach as inet6_fill_ifaddr below: save       */
 /*  skb->len before the fill, trim back on return, return 0. The      */
 /*  iterator then sees a successful entry of zero bytes and advances. */
+/*																																		*/
+/*  Using a generic 10-argument forwarder to ensure we don't corrupt  */
+/*  the stack on x86_64, while correctly intercepting the first       */
+/*  2 arguments we need.																							*/
 /* ================================================================== */
 
-struct rtnl_fill_data {
-	struct sk_buff *skb;
-	unsigned int saved_len;
-	bool should_filter;
-};
+typedef int (*rtnl_fill_ifinfo_t)(struct sk_buff *skb, struct net_device *dev, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9, void *a10);
+static rtnl_fill_ifinfo_t orig_rtnl_fill_ifinfo;
 
-static int rtnl_fill_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct rtnl_fill_data *data = (void *)ri->data;
-	struct net_device *dev;
+static int hook_rtnl_fill_ifinfo(struct sk_buff *skb, struct net_device *dev, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9, void *a10) {
+    /* Save state BEFORE calling original function using local stack */
+    unsigned int saved_len = skb ? skb->len : 0;
+    bool target = is_target_uid();
+    /* Call the original function transparently */
+    int ret = orig_rtnl_fill_ifinfo(skb, dev, a3, a4, a5, a6, a7, a8, a9, a10);
 
-	data->should_filter = false;
-
-	if (!is_target_uid()) {
-		vpnhide_dbg("rtnl_fill_entry: uid=%u target=0\n",
-			    from_kuid(&init_user_ns, current_uid()));
-		return 0;
-	}
-
-	/*
-	 * rtnl_fill_ifinfo(struct sk_buff *skb, struct net_device *dev, ...)
-	 * arm64: x0=skb, x1=dev
-	 */
-	dev = (struct net_device *)regs->regs[1];
-	/* Callers hold RTNL which protects dev->name, but take RCU as
-	 * belt-and-suspenders — same rationale as inet6_fill_entry. */
-	rcu_read_lock();
-	if (dev && is_vpn_ifname(dev->name)) {
-		data->skb = (struct sk_buff *)regs->regs[0];
-		data->saved_len = data->skb ? data->skb->len : 0;
-		data->should_filter = true;
-		vpnhide_dbg(
-			"rtnl_fill_entry: uid=%u target=1 iface=%s -> filter\n",
-			from_kuid(&init_user_ns, current_uid()), dev->name);
-	} else {
-		vpnhide_dbg(
-			"rtnl_fill_entry: uid=%u target=1 iface=%s -> pass\n",
-			from_kuid(&init_user_ns, current_uid()),
-			dev ? dev->name : "(null)");
-	}
-	rcu_read_unlock();
-
-	return 0;
+    /* Post-process the result */
+    if (ret == 0 && target && skb && dev) {
+        rcu_read_lock();
+        if (is_vpn_ifname(dev->name)) {
+            vpnhide_dbg("rtnl_fill_ifinfo: trimming skb %u -> %u\n", skb->len, saved_len);
+            skb_trim(skb, saved_len);
+        }
+        rcu_read_unlock();
+    }
+    return ret;
 }
-
-static int rtnl_fill_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct rtnl_fill_data *data = (void *)ri->data;
-
-	if (!data->should_filter || !data->skb)
-		return 0;
-
-	vpnhide_dbg("rtnl_fill_ret: trimming skb %u -> %u\n", data->skb->len,
-		    data->saved_len);
-	/* Undo whatever the fill function wrote to the skb */
-	skb_trim(data->skb, data->saved_len);
-	regs_set_return_value(regs, 0);
-	return 0;
-}
-
-static struct kretprobe rtnl_fill_krp = {
-	.handler = rtnl_fill_ret,
-	.entry_handler = rtnl_fill_entry,
-	.data_size = sizeof(struct rtnl_fill_data),
-	.maxactive = VPNHIDE_KRETPROBE_MAXACTIVE,
-	.kp.symbol_name = "rtnl_fill_ifinfo",
-};
 
 /* ================================================================== */
 /*  Hook 4: inet6_fill_ifaddr — RTM_GETADDR IPv6 (getifaddrs path)   */
-/*                                                                    */
-/*  inet6_fill_ifaddr(struct sk_buff *skb, struct inet6_ifaddr *ifa,  */
-/*                    struct inet6_fill_args *args)                   */
-/*  arm64: x0=skb, x1=ifa                                           */
 /*                                                                    */
 /*  getifaddrs() does RTM_GETLINK (filtered by hook 3) then          */
 /*  RTM_GETADDR. Addresses for VPN interfaces still appear in        */
@@ -579,130 +546,54 @@ static struct kretprobe rtnl_fill_krp = {
 /*  making it look like the entry was never written. Return 0.       */
 /* ================================================================== */
 
-struct inet6_fill_data {
-	struct sk_buff *skb;
-	unsigned int saved_len;
-	bool should_filter;
-};
+typedef int (*inet6_fill_ifaddr_t)(struct sk_buff *skb, struct inet6_ifaddr *ifa, void *a3);
+static inet6_fill_ifaddr_t orig_inet6_fill_ifaddr;
 
-static int inet6_fill_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct inet6_fill_data *data = (void *)ri->data;
-	struct inet6_ifaddr *ifa;
+static int hook_inet6_fill_ifaddr(struct sk_buff *skb, struct inet6_ifaddr *ifa, void *a3) {
+    /* Save skb length before the fill operation */
+    unsigned int saved_len = skb ? skb->len : 0;
+    bool target = is_target_uid();
+    /* Execute the original function */
+    int ret = orig_inet6_fill_ifaddr(skb, ifa, a3);
 
-	data->should_filter = false;
-
-	if (!is_target_uid())
-		return 0;
-
-	ifa = (struct inet6_ifaddr *)regs->regs[1];
-	/*
-	 * The callers of inet6_fill_ifaddr() hold either rcu_read_lock()
-	 * (netlink dump path) or RTNL. We take rcu_read_lock() explicitly
-	 * so the kretprobe handler doesn't rely on that implicit guarantee.
-	 */
-	rcu_read_lock();
-	if (ifa && ifa->idev && ifa->idev->dev &&
-	    is_vpn_ifname(ifa->idev->dev->name)) {
-		data->skb = (struct sk_buff *)regs->regs[0];
-		data->saved_len = data->skb ? data->skb->len : 0;
-		data->should_filter = true;
-		vpnhide_dbg("inet6_fill_entry: uid=%u iface=%s -> filter\n",
-			    from_kuid(&init_user_ns, current_uid()),
-			    ifa->idev->dev->name);
-	}
-	rcu_read_unlock();
-
-	return 0;
+    /* If it succeeded and target matches, check if we need to trim */
+    if (ret == 0 && target && skb && ifa) {
+        rcu_read_lock();
+        if (ifa->idev && ifa->idev->dev && is_vpn_ifname(ifa->idev->dev->name)) {
+            vpnhide_dbg("inet6_fill_ifaddr: trimming skb %u -> %u\n", skb->len, saved_len);
+            skb_trim(skb, saved_len);
+        }
+        rcu_read_unlock();
+    }
+    return ret;
 }
-
-static int inet6_fill_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct inet6_fill_data *data = (void *)ri->data;
-
-	if (!data->should_filter || !data->skb)
-		return 0;
-
-	vpnhide_dbg("inet6_fill_ret: trimming skb %u -> %u\n", data->skb->len,
-		    data->saved_len);
-	/* Undo whatever the fill function wrote to the skb */
-	skb_trim(data->skb, data->saved_len);
-	regs_set_return_value(regs, 0);
-	return 0;
-}
-
-static struct kretprobe inet6_fill_krp = {
-	.handler = inet6_fill_ret,
-	.entry_handler = inet6_fill_entry,
-	.data_size = sizeof(struct inet6_fill_data),
-	.maxactive = VPNHIDE_KRETPROBE_MAXACTIVE,
-	.kp.symbol_name = "inet6_fill_ifaddr",
-};
 
 /* ================================================================== */
 /*  Hook 5: inet_fill_ifaddr — RTM_GETADDR IPv4 (getifaddrs path)    */
-/*                                                                    */
-/*  inet_fill_ifaddr(struct sk_buff *skb, struct in_ifaddr *ifa,     */
-/*                   struct inet_fill_args *args)                    */
-/*  arm64: x0=skb, x1=ifa                                           */
 /*  Same skb-trim approach as hook 4.                                */
 /* ================================================================== */
 
-struct inet_fill_data {
-	struct sk_buff *skb;
-	unsigned int saved_len;
-	bool should_filter;
-};
+typedef int (*inet_fill_ifaddr_t)(struct sk_buff *skb, struct in_ifaddr *ifa, void *a3);
+static inet_fill_ifaddr_t orig_inet_fill_ifaddr;
 
-static int inet_fill_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct inet_fill_data *data = (void *)ri->data;
-	struct in_ifaddr *ifa;
+static int hook_inet_fill_ifaddr(struct sk_buff *skb, struct in_ifaddr *ifa, void *a3) {
+    /* Save skb length before the fill operation */
+    unsigned int saved_len = skb ? skb->len : 0;
+    bool target = is_target_uid();
+    /* Execute the original function */
+    int ret = orig_inet_fill_ifaddr(skb, ifa, a3);
 
-	data->should_filter = false;
-
-	if (!is_target_uid())
-		return 0;
-
-	ifa = (struct in_ifaddr *)regs->regs[1];
-	/* Same RCU rationale as inet6_fill_entry above. */
-	rcu_read_lock();
-	if (ifa && ifa->ifa_dev && ifa->ifa_dev->dev &&
-	    is_vpn_ifname(ifa->ifa_dev->dev->name)) {
-		data->skb = (struct sk_buff *)regs->regs[0];
-		data->saved_len = data->skb ? data->skb->len : 0;
-		data->should_filter = true;
-		vpnhide_dbg("inet_fill_entry: uid=%u iface=%s -> filter\n",
-			    from_kuid(&init_user_ns, current_uid()),
-			    ifa->ifa_dev->dev->name);
-	}
-	rcu_read_unlock();
-
-	return 0;
+    /* If it succeeded and target matches, check if we need to trim */
+    if (ret == 0 && target && skb && ifa) {
+        rcu_read_lock();
+        if (ifa->ifa_dev && ifa->ifa_dev->dev && is_vpn_ifname(ifa->ifa_dev->dev->name)) {
+            vpnhide_dbg("inet_fill_ifaddr: trimming skb %u -> %u\n", skb->len, saved_len);
+            skb_trim(skb, saved_len);
+        }
+        rcu_read_unlock();
+    }
+    return ret;
 }
-
-static int inet_fill_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct inet_fill_data *data = (void *)ri->data;
-
-	if (!data->should_filter || !data->skb)
-		return 0;
-
-	vpnhide_dbg("inet_fill_ret: trimming skb %u -> %u\n", data->skb->len,
-		    data->saved_len);
-	skb_trim(data->skb, data->saved_len);
-	regs_set_return_value(regs, 0);
-	return 0;
-}
-
-static struct kretprobe inet_fill_krp = {
-	.handler = inet_fill_ret,
-	.entry_handler = inet_fill_entry,
-	.data_size = sizeof(struct inet_fill_data),
-	.maxactive = VPNHIDE_KRETPROBE_MAXACTIVE,
-	.kp.symbol_name = "inet_fill_ifaddr",
-};
-
 /* ================================================================== */
 /*  Hook 6: fib_route_seq_show — /proc/net/route                      */
 /*                                                                    */
@@ -710,109 +601,61 @@ static struct kretprobe inet_fill_krp = {
 /*  more tab-separated route lines into seq->buf, each ending with   */
 /*  '\n'. The first field is the interface name.                      */
 /*                                                                    */
-/*  We save seq and seq->count on entry. In the return handler we    */
-/*  scan what was written, compact out VPN lines, and adjust count.  */
+/*  We access seq->buf and seq->count without seq_file's internal mutex. */
+/*  This is safe because seq_read() drives the ->show() callback      */
+/*  synchronously under its own fd context — no concurrent access to  */
+/*  the same seq_file is possible because we first call to the original */
+/*  function and then our hook is executed.												 	*/
 /* ================================================================== */
 
-struct fib_route_data {
-	struct seq_file *seq;
-	size_t start_count;
-	bool target;
-};
+typedef int (*fib_route_seq_show_t)(struct seq_file *seq, void *v);
+static fib_route_seq_show_t orig_fib_route_seq_show;
 
-static int fib_route_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct fib_route_data *data = (void *)ri->data;
+static int hook_fib_route_seq_show(struct seq_file *seq, void *v) {
+    size_t start_count = seq ? seq->count : 0;
+    int ret = orig_fib_route_seq_show(seq, v);
 
-	/*
-	 * arm64: x0 = seq_file*, x1 = v (iterator element).
-	 * Save seq pointer and current buffer position so the
-	 * return handler knows where this call's output begins.
-	 */
-	data->seq = (struct seq_file *)regs->regs[0];
-	data->target = is_target_uid();
+    if (ret == 0 && is_target_uid() && seq && seq->buf && seq->count > start_count) {
+				/*
+				* Scan the region [start_count, seq->count) for lines whose
+				* first tab-separated field is a VPN interface name. Compact
+				* out matching lines in place and adjust seq->count.
+				*
+				* Each route line looks like: "tun0\t08000000\t...\n"
+				*/
+        char *buf = seq->buf;
+        char *src = buf + start_count;
+        char *dst = src;
+        char *end = buf + seq->count;
+        char ifname[IFNAMSIZ];
+        int j;
 
-	if (data->target && data->seq) {
-		data->start_count = data->seq->count;
-		vpnhide_dbg("fib_route_entry: uid=%u target=1\n",
-			    from_kuid(&init_user_ns, current_uid()));
-	} else {
-		data->start_count = 0;
-	}
+        while (src < end) {
+            char *nl = memchr(src, '\n', end - src);
+            char *line_end = nl ? nl + 1 : end;
+            size_t line_len = line_end - src;
 
-	return 0;
+						/* Extract the interface name (first field, tab-delimited) */
+            for (j = 0; j < IFNAMSIZ - 1 && j < (int)line_len && src[j] != '\t' && src[j] != '\n'; j++)
+                ifname[j] = src[j];
+            ifname[j] = '\0';
+
+            if (is_vpn_ifname(ifname)) {
+								/* Skip this line */
+                src = line_end;
+                continue;
+            }
+
+						/* Keep this line — move it down if there's a gap */
+            if (dst != src)
+							memmove(dst, src, line_len);
+            dst += line_len;
+            src = line_end;
+        }
+        seq->count = dst - buf;
+    }
+    return ret;
 }
-
-/*
- * We access seq->buf and seq->count without seq_file's internal mutex.
- * This is safe because seq_read() drives the ->show() callback
- * synchronously under its own fd context — no concurrent access to
- * the same seq_file is possible between our entry and return handlers.
- */
-static int fib_route_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct fib_route_data *data = (void *)ri->data;
-	struct seq_file *seq = data->seq;
-	char *buf, *src, *dst, *end;
-	char ifname[IFNAMSIZ];
-	int j;
-
-	if (!data->target || !seq || !seq->buf)
-		return 0;
-
-	if (seq->count <= data->start_count)
-		return 0;
-
-	/*
-	 * Scan the region [start_count, seq->count) for lines whose
-	 * first tab-separated field is a VPN interface name. Compact
-	 * out matching lines in place and adjust seq->count.
-	 *
-	 * Each route line looks like: "tun0\t08000000\t...\n"
-	 */
-	buf = seq->buf;
-	src = buf + data->start_count;
-	dst = src;
-	end = buf + seq->count;
-
-	while (src < end) {
-		char *nl = memchr(src, '\n', end - src);
-		char *line_end = nl ? nl + 1 : end;
-		size_t line_len = line_end - src;
-
-		/* Extract the interface name (first field, tab-delimited) */
-		for (j = 0; j < IFNAMSIZ - 1 && j < (int)line_len &&
-			    src[j] != '\t' && src[j] != '\n';
-		     j++)
-			ifname[j] = src[j];
-		ifname[j] = '\0';
-
-		if (is_vpn_ifname(ifname)) {
-			vpnhide_dbg("fib_route_ret: hiding route for %s\n",
-				    ifname);
-			/* Skip this line */
-			src = line_end;
-			continue;
-		}
-
-		/* Keep this line — move it down if there's a gap */
-		if (dst != src)
-			memmove(dst, src, line_len);
-		dst += line_len;
-		src = line_end;
-	}
-
-	seq->count = dst - buf;
-	return 0;
-}
-
-static struct kretprobe fib_route_krp = {
-	.handler = fib_route_ret,
-	.entry_handler = fib_route_entry,
-	.data_size = sizeof(struct fib_route_data),
-	.maxactive = VPNHIDE_KRETPROBE_MAXACTIVE,
-	.kp.symbol_name = "fib_route_seq_show",
-};
 
 /* ================================================================== */
 /*  Hook 7: ipv6_route_seq_show — /proc/net/ipv6_route                */
@@ -822,427 +665,132 @@ static struct kretprobe fib_route_krp = {
 /*  IPv4 /proc/net/route strategy above.                              */
 /* ================================================================== */
 
-static int ipv6_route_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct fib_route_data *data = (void *)ri->data;
+typedef int (*ipv6_route_seq_show_t)(struct seq_file *seq, void *v);
+static ipv6_route_seq_show_t orig_ipv6_route_seq_show;
 
-	data->seq = (struct seq_file *)regs->regs[0];
-	data->target = is_target_uid();
+static int hook_ipv6_route_seq_show(struct seq_file *seq, void *v) {
+    size_t start_count = seq ? seq->count : 0;
+    int ret = orig_ipv6_route_seq_show(seq, v);
 
-	if (data->target && data->seq) {
-		data->start_count = data->seq->count;
-		vpnhide_dbg("ipv6_route_entry: uid=%u target=1\n",
-			    from_kuid(&init_user_ns, current_uid()));
-	} else {
-		data->start_count = 0;
-	}
+    if (ret == 0 && is_target_uid() && seq && seq->buf && seq->count > start_count) {
+        char *buf = seq->buf;
+        char *src = buf + start_count;
+        char *dst = src;
+        char *end = buf + seq->count;
+        char ifname[IFNAMSIZ];
+        int j;
 
-	return 0;
-}
+        while (src < end) {
+            char *nl = memchr(src, '\n', end - src);
+            char *line_end = nl ? nl + 1 : end;
+            size_t line_len = line_end - src;
+            char *field_start;
+            char *field_end = line_end;
 
-static int ipv6_route_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct fib_route_data *data = (void *)ri->data;
-	struct seq_file *seq = data->seq;
-	char *buf, *src, *dst, *end;
-	char ifname[IFNAMSIZ];
-	int j;
+            /* Parse backwards from the end of the line to find the last field */
+            while (field_end > src &&
+                   (field_end[-1] == '\n' || field_end[-1] == '\r' ||
+                    field_end[-1] == ' ' || field_end[-1] == '\t'))
+                field_end--;
+            
+            field_start = field_end;
+            while (field_start > src && field_start[-1] != ' ' &&
+                   field_start[-1] != '\t')
+                field_start--;
 
-	if (!data->target || !seq || !seq->buf)
-		return 0;
-	if (seq->count <= data->start_count)
-		return 0;
+            /* Copy the extracted interface name */
+            for (j = 0; j < IFNAMSIZ - 1 && (field_start + j) < field_end; j++)
+                ifname[j] = field_start[j];
+            ifname[j] = '\0';
 
-	buf = seq->buf;
-	src = buf + data->start_count;
-	dst = src;
-	end = buf + seq->count;
+            /* If it matches a VPN interface, skip this line in the buffer */
+            if (is_vpn_ifname(ifname)) {
+                vpnhide_dbg("ipv6_route_seq_show: hiding route for %s\n", ifname);
+                src = line_end;
+                continue;
+            }
 
-	while (src < end) {
-		char *nl = memchr(src, '\n', end - src);
-		char *line_end = nl ? nl + 1 : end;
-		size_t line_len = line_end - src;
-		char *field_start;
-		char *field_end = line_end;
-
-		while (field_end > src &&
-		       (field_end[-1] == '\n' || field_end[-1] == '\r' ||
-			field_end[-1] == ' ' || field_end[-1] == '\t'))
-			field_end--;
-		field_start = field_end;
-		while (field_start > src && field_start[-1] != ' ' &&
-		       field_start[-1] != '\t')
-			field_start--;
-
-		for (j = 0; j < IFNAMSIZ - 1 && (field_start + j) < field_end;
-		     j++)
-			ifname[j] = field_start[j];
-		ifname[j] = '\0';
-
-		if (is_vpn_ifname(ifname)) {
-			vpnhide_dbg("ipv6_route_ret: hiding route for %s\n",
-				    ifname);
-			src = line_end;
-			continue;
-		}
-
-		if (dst != src)
-			memmove(dst, src, line_len);
-		dst += line_len;
-		src = line_end;
-	}
-
-	seq->count = dst - buf;
-	return 0;
-}
-
-static struct kretprobe ipv6_route_krp = {
-	.handler = ipv6_route_ret,
-	.entry_handler = ipv6_route_entry,
-	.data_size = sizeof(struct fib_route_data),
-	.maxactive = VPNHIDE_KRETPROBE_MAXACTIVE,
-	.kp.symbol_name = "ipv6_route_seq_show",
-};
-
-/* ================================================================== */
-/*  Route netlink helpers                                             */
-/* ================================================================== */
-
-static bool copy_dev_name(struct net_device *dev, char name[IFNAMSIZ])
-{
-	if (!dev)
-		return false;
-	if (copy_from_kernel_nofault(name, dev->name, IFNAMSIZ) != 0)
-		return false;
-	name[IFNAMSIZ - 1] = '\0';
-	return true;
-}
-
-static bool is_physical_ifname(const char *name)
-{
-	return vpnhide_iface_starts_with_ci(name, "rmnet") ||
-	       vpnhide_iface_starts_with_ci(name, "wlan") ||
-	       vpnhide_iface_starts_with_ci(name, "eth") ||
-	       vpnhide_iface_starts_with_ci(name, "ccmni") ||
-	       vpnhide_iface_starts_with_ci(name, "ccemni") ||
-	       vpnhide_iface_starts_with_ci(name, "seth");
-}
-
-static bool is_public_ipv4(__be32 addr)
-{
-	u32 host = be32_to_cpu(addr);
-	u8 a = (host >> 24) & 0xff;
-	u8 b = (host >> 16) & 0xff;
-	u8 c = (host >> 8) & 0xff;
-
-	if (a == 0 || a == 10 || a == 127 || a >= 224)
-		return false;
-	if (a == 100 && b >= 64 && b <= 127)
-		return false;
-	if (a == 169 && b == 254)
-		return false;
-	if (a == 172 && b >= 16 && b <= 31)
-		return false;
-	if (a == 192 && b == 168)
-		return false;
-	if (a == 192 && b == 0 && c == 0)
-		return false;
-	if (a == 192 && b == 0 && c == 2)
-		return false;
-	if (a == 198 && (b == 18 || b == 19))
-		return false;
-	if (a == 198 && b == 51 && c == 100)
-		return false;
-	if (a == 203 && b == 0 && c == 113)
-		return false;
-	return true;
-}
-
-static bool is_public_host_route_via_physical(const struct fib_rt_info *fri,
-					      struct net_device *dev)
-{
-	char name[IFNAMSIZ];
-
-	if (!fri || !dev || fri->dst_len != 32 || !is_public_ipv4(fri->dst))
-		return false;
-	if (!copy_dev_name(dev, name))
-		return false;
-	return is_physical_ifname(name);
-}
-
-static bool is_public_ipv6(const struct in6_addr *addr)
-{
-	u8 b0 = addr->s6_addr[0];
-
-	/* Global unicast 2000::/3 only. Excludes ::/:: 1 (unspec/loopback),
-	 * fe80::/10 (link-local), fc00::/7 (ULA), ff00::/8 (multicast). */
-	if ((b0 & 0xe0) != 0x20)
-		return false;
-	/* 2001:db8::/32 documentation range. */
-	if (addr->s6_addr[0] == 0x20 && addr->s6_addr[1] == 0x01 &&
-	    addr->s6_addr[2] == 0x0d && addr->s6_addr[3] == 0xb8)
-		return false;
-	return true;
-}
-
-/* IPv6 analogue of is_public_host_route_via_physical: a /128 route to a
- * public address pinned to a physical interface is the host-route a VPN
- * client installs so tunnel packets can reach the server — it leaks the
- * server's IPv6 even when the tun interface itself is hidden. fib6_dst
- * (struct rt6key { struct in6_addr addr; int plen; }) is stable across
- * GKI 5.10..6.12; read it fault-safe since `rt` comes from a raw reg. */
-static bool is_public_host_route6_via_physical(struct fib6_info *rt,
-					       struct net_device *dev)
-{
-	struct in6_addr addr;
-	int plen = 0;
-	char name[IFNAMSIZ];
-
-	if (!rt || !dev)
-		return false;
-	if (copy_from_kernel_nofault(&plen, &rt->fib6_dst.plen, sizeof(plen)) !=
-		    0 ||
-	    plen != 128)
-		return false;
-	if (copy_from_kernel_nofault(&addr, &rt->fib6_dst.addr, sizeof(addr)) !=
-		    0 ||
-	    !is_public_ipv6(&addr))
-		return false;
-	if (!copy_dev_name(dev, name))
-		return false;
-	return is_physical_ifname(name);
-}
-
-static struct net_device *dev_from_nexthop(struct nexthop *nh)
-{
-	struct net_device *dev = NULL;
-	bool is_group = false;
-
-	if (!nh)
-		return NULL;
-
-	if (copy_from_kernel_nofault(&is_group, &nh->is_group,
-				     sizeof(is_group)) != 0)
-		return NULL;
-
-	if (is_group) {
-		struct nh_group *nh_grp = NULL;
-		struct nexthop *first_nh = NULL;
-		u16 num_nh = 0;
-
-		if (copy_from_kernel_nofault(&nh_grp, &nh->nh_grp,
-					     sizeof(nh_grp)) != 0 ||
-		    !nh_grp)
-			return NULL;
-		if (copy_from_kernel_nofault(&num_nh, &nh_grp->num_nh,
-					     sizeof(num_nh)) != 0 ||
-		    num_nh == 0)
-			return NULL;
-		if (copy_from_kernel_nofault(&first_nh,
-					     &nh_grp->nh_entries[0].nh,
-					     sizeof(first_nh)) != 0 ||
-		    !first_nh)
-			return NULL;
-		nh = first_nh;
-	}
-
-	{
-		struct nh_info *nhi = NULL;
-
-		if (copy_from_kernel_nofault(&nhi, &nh->nh_info, sizeof(nhi)) ==
-			    0 &&
-		    nhi) {
-			copy_from_kernel_nofault(&dev, &nhi->fib_nhc.nhc_dev,
-						 sizeof(dev));
-		}
-	}
-
-	return dev;
-}
-
-static struct net_device *dev_from_fib_info(struct fib_info *fi)
-{
-	struct net_device *dev = NULL;
-	struct nexthop *nh = NULL;
-
-	if (!fi)
-		return NULL;
-
-	if (copy_from_kernel_nofault(&nh, &fi->nh, sizeof(nh)) == 0 && nh) {
-		dev = dev_from_nexthop(nh);
-	} else {
-		int fib_nhs = 0;
-
-		if (copy_from_kernel_nofault(&fib_nhs, &fi->fib_nhs,
-					     sizeof(fib_nhs)) == 0 &&
-		    fib_nhs > 0) {
-			copy_from_kernel_nofault(
-				&dev, &fi->fib_nh[0].nh_common.nhc_dev,
-				sizeof(dev));
-		}
-	}
-
-	return dev;
-}
-
-static struct net_device *dev_from_fib6_info(struct fib6_info *rt)
-{
-	struct net_device *dev = NULL;
-	struct nexthop *nh = NULL;
-
-	if (!rt)
-		return NULL;
-
-	if (copy_from_kernel_nofault(&nh, &rt->nh, sizeof(nh)) == 0 && nh) {
-		dev = dev_from_nexthop(nh);
-	} else {
-		copy_from_kernel_nofault(
-			&dev, &rt->fib6_nh[0].nh_common.nhc_dev, sizeof(dev));
-	}
-
-	return dev;
-}
-
-struct route_skb_data {
-	struct sk_buff *skb;
-	unsigned int saved_len;
-	bool should_filter;
-};
-
-static void init_route_skb_data(struct route_skb_data *data)
-{
-	data->skb = NULL;
-	data->saved_len = 0;
-	data->should_filter = false;
-}
-
-static int route_skb_ret(struct route_skb_data *data, struct pt_regs *regs,
-			 const char *hook_name)
-{
-	if (!data->should_filter || !data->skb)
-		return 0;
-
-	if (regs_return_value(regs) >= 0) {
-		vpnhide_dbg("%s: trimming skb %u -> %u\n", hook_name,
-			    data->skb->len, data->saved_len);
-		skb_trim(data->skb, data->saved_len);
-		regs_set_return_value(regs, 0);
-	}
-	return 0;
+            /* Otherwise, shift the line back into the valid portion of the buffer */
+            if (dst != src)
+                memmove(dst, src, line_len);
+            dst += line_len;
+            src = line_end;
+        }
+        seq->count = dst - buf;
+    }
+    return ret;
 }
 
 /* ================================================================== */
 /*  Hook 8: fib_dump_info — IPv4 RTM_GETROUTE dumps                   */
-/*                                                                    */
-/*  arm64: x0=skb, x4=fri (struct fib_rt_info*)                      */
 /* ================================================================== */
 
-static int fib_dump_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct route_skb_data *data = (void *)ri->data;
-	struct fib_rt_info *fri = (struct fib_rt_info *)regs->regs[4];
-	struct fib_rt_info fri_copy;
-	struct net_device *dev = NULL;
-	char dev_name[IFNAMSIZ];
-	bool vpn_route;
-	bool host_hint;
+typedef int (*fib_dump_info_t)(struct sk_buff *skb, void *a2, void *a3, void *a4, struct fib_rt_info *fri, void *a6);
+static fib_dump_info_t orig_fib_dump_info;
 
-	init_route_skb_data(data);
+static int hook_fib_dump_info(struct sk_buff *skb, void *a2, void *a3, void *a4, struct fib_rt_info *fri, void *a6) {
+    unsigned int saved_len = skb ? skb->len : 0;
+    bool target = is_target_uid();
+    int ret = orig_fib_dump_info(skb, a2, a3, a4, fri, a6);
 
-	if (!is_target_uid() || !fri)
-		return 0;
-	if (copy_from_kernel_nofault(&fri_copy, fri, sizeof(fri_copy)) != 0)
-		return 0;
+    if (ret >= 0 && target && skb && fri) {
+        struct fib_rt_info fri_copy;
+        if (copy_from_kernel_nofault(&fri_copy, fri, sizeof(fri_copy)) == 0) {
+            struct net_device *dev;
+            char dev_name[IFNAMSIZ];
+            bool vpn_route, host_hint;
 
-	rcu_read_lock();
-	dev = dev_from_fib_info(fri_copy.fi);
-	if (!copy_dev_name(dev, dev_name)) {
-		rcu_read_unlock();
-		return 0;
-	}
-	vpn_route = is_vpn_ifname(dev_name);
-	host_hint = is_public_host_route_via_physical(&fri_copy, dev);
-	if (vpn_route || host_hint) {
-		data->skb = (struct sk_buff *)regs->regs[0];
-		data->saved_len = data->skb ? data->skb->len : 0;
-		data->should_filter = true;
-		vpnhide_dbg("fib_dump_entry: hiding %s via %s\n",
-			    vpn_route ? "VPN route" : "public host route",
-			    dev_name);
-	}
-	rcu_read_unlock();
-
-	return 0;
+            rcu_read_lock();
+            dev = dev_from_fib_info(fri_copy.fi);
+            if (copy_dev_name(dev, dev_name)) {
+                vpn_route = is_vpn_ifname(dev_name);
+                host_hint = is_public_host_route_via_physical(&fri_copy, dev);
+                if (vpn_route || host_hint) {
+                    vpnhide_dbg("fib_dump_info: hiding %s via %s\n", vpn_route ? "VPN route" : "public host route", dev_name);
+                    skb_trim(skb, saved_len);
+                    ret = 0; /* Report success despite trimming, to keep netlink iteration going */
+                }
+            }
+            rcu_read_unlock();
+        }
+    }
+    return ret;
 }
-
-static int fib_dump_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	return route_skb_ret((void *)ri->data, regs, "fib_dump_ret");
-}
-
-static struct kretprobe fib_dump_krp = {
-	.handler = fib_dump_ret,
-	.entry_handler = fib_dump_entry,
-	.data_size = sizeof(struct route_skb_data),
-	.maxactive = VPNHIDE_KRETPROBE_MAXACTIVE,
-	.kp.symbol_name = "fib_dump_info",
-};
 
 /* ================================================================== */
 /*  Hook 9: rt6_fill_node — IPv6 RTM_GETROUTE                         */
-/*                                                                    */
-/*  arm64: x1=skb, x2=rt (struct fib6_info*), x3=dst                 */
 /* ================================================================== */
 
-static int rt6_fill_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct route_skb_data *data = (void *)ri->data;
-	struct fib6_info *rt = (struct fib6_info *)regs->regs[2];
-	struct dst_entry *dst = (struct dst_entry *)regs->regs[3];
-	struct net_device *dev = NULL;
-	char dev_name[IFNAMSIZ];
+typedef int (*rt6_fill_node_t)(void *net, struct sk_buff *skb, struct fib6_info *rt, struct dst_entry *dst, void *a5, void *a6, void *a7, void *a8, void *a9, void *a10);
+static rt6_fill_node_t orig_rt6_fill_node;
 
-	init_route_skb_data(data);
+static int hook_rt6_fill_node(void *net, struct sk_buff *skb, struct fib6_info *rt, struct dst_entry *dst, void *a5, void *a6, void *a7, void *a8, void *a9, void *a10) {
+    unsigned int saved_len = skb ? skb->len : 0;
+    bool target = is_target_uid();
+    int ret = orig_rt6_fill_node(net, skb, rt, dst, a5, a6, a7, a8, a9, a10);
 
-	if (!is_target_uid())
-		return 0;
+    if (ret >= 0 && target && skb) {
+        struct net_device *dev = NULL;
+        char dev_name[IFNAMSIZ];
+        
+        rcu_read_lock();
+        dev = dev_from_fib6_info(rt);
+        if (!dev && dst) copy_from_kernel_nofault(&dev, &dst->dev, sizeof(dev));
+        
+        if (copy_dev_name(dev, dev_name)) {
+            bool vpn_route = is_vpn_ifname(dev_name);
+            bool host_hint = !vpn_route && is_public_host_route6_via_physical(rt, dev);
 
-	rcu_read_lock();
-	dev = dev_from_fib6_info(rt);
-	if (!dev && dst)
-		copy_from_kernel_nofault(&dev, &dst->dev, sizeof(dev));
-	if (copy_dev_name(dev, dev_name)) {
-		bool vpn_route = is_vpn_ifname(dev_name);
-		bool host_hint = !vpn_route &&
-				 is_public_host_route6_via_physical(rt, dev);
-
-		if (vpn_route || host_hint) {
-			data->skb = (struct sk_buff *)regs->regs[1];
-			data->saved_len = data->skb ? data->skb->len : 0;
-			data->should_filter = true;
-			vpnhide_dbg("rt6_fill_entry: hiding %s via %s\n",
-				    vpn_route ? "VPN route" :
-						"public host route",
-				    dev_name);
-		}
-	}
-	rcu_read_unlock();
-
-	return 0;
+            if (vpn_route || host_hint) {
+                vpnhide_dbg("rt6_fill_node: hiding %s via %s\n", vpn_route ? "VPN route" : "public host route", dev_name);
+                skb_trim(skb, saved_len);
+                ret = 0; /* Report success despite trimming */
+            }
+        }
+        rcu_read_unlock();
+    }
+    return ret;
 }
-
-static int rt6_fill_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	return route_skb_ret((void *)ri->data, regs, "rt6_fill_ret");
-}
-
-static struct kretprobe rt6_fill_krp = {
-	.handler = rt6_fill_ret,
-	.entry_handler = rt6_fill_entry,
-	.data_size = sizeof(struct route_skb_data),
-	.maxactive = VPNHIDE_KRETPROBE_MAXACTIVE,
-	.kp.symbol_name = "rt6_fill_node",
-};
 
 /*
  * Note: rt_fill_info (single-lookup RTM_GETROUTE serializer for
@@ -1270,169 +818,160 @@ static struct kretprobe rt6_fill_krp = {
 
 /* ================================================================== */
 /*  Hook 10: fib_nl_fill_rule — RTM_GETRULE policy rules              */
-/*                                                                    */
-/*  arm64: x0=skb, x1=rule (struct fib_rule*)                        */
 /* ================================================================== */
+typedef int (*fib_nl_fill_rule_t)(struct sk_buff *skb, struct fib_rule *rule, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9, void *a10);
+static fib_nl_fill_rule_t orig_fib_nl_fill_rule;
 
-static int fib_rule_fill_entry(struct kretprobe_instance *ri,
-			       struct pt_regs *regs)
-{
-	struct route_skb_data *data = (void *)ri->data;
-	struct fib_rule *rule = (struct fib_rule *)regs->regs[1];
-	struct fib_rule rule_copy;
-	uid_t uid;
-	bool filter = false;
+static int hook_fib_nl_fill_rule(struct sk_buff *skb, struct fib_rule *rule, void *a3, void *a4, void *a5, void *a6, void *a7, void *a8, void *a9, void *a10) {
+    unsigned int saved_len = skb ? skb->len : 0;
+    bool target = is_target_uid();
+    int ret = orig_fib_nl_fill_rule(skb, rule, a3, a4, a5, a6, a7, a8, a9, a10);
 
-	init_route_skb_data(data);
+    if (ret >= 0 && target && skb && rule) {
+        struct fib_rule rule_copy;
+        
+        if (copy_from_kernel_nofault(&rule_copy, rule, sizeof(rule_copy)) == 0) {
+            uid_t uid = from_kuid(&init_user_ns, current_uid());
+            bool filter = false;
 
-	if (!is_target_uid() || !rule)
-		return 0;
-	if (copy_from_kernel_nofault(&rule_copy, rule, sizeof(rule_copy)) != 0)
-		return 0;
+            if ((rule_copy.iifname[0] != '\0' && is_vpn_ifname(rule_copy.iifname)) ||
+                (rule_copy.oifname[0] != '\0' && is_vpn_ifname(rule_copy.oifname))) {
+                filter = true;
+            } else {
+                uid_t start = from_kuid(&init_user_ns, rule_copy.uid_range.start);
+                uid_t end = from_kuid(&init_user_ns, rule_copy.uid_range.end);
 
-	uid = from_kuid(&init_user_ns, current_uid());
+                if (uid >= start && uid <= end && (start != 0 || end != (uid_t)~0) &&
+                    rule_copy.table != RT_TABLE_MAIN && rule_copy.table != RT_TABLE_LOCAL &&
+                    rule_copy.table != RT_TABLE_DEFAULT && rule_copy.table > 100) {
+                    filter = true;
+                }
+            }
 
-	if ((rule_copy.iifname[0] != '\0' &&
-	     is_vpn_ifname(rule_copy.iifname)) ||
-	    (rule_copy.oifname[0] != '\0' &&
-	     is_vpn_ifname(rule_copy.oifname))) {
-		filter = true;
-	} else {
-		uid_t start =
-			from_kuid(&init_user_ns, rule_copy.uid_range.start);
-		uid_t end = from_kuid(&init_user_ns, rule_copy.uid_range.end);
-
-		if (uid >= start && uid <= end &&
-		    (start != 0 || end != (uid_t)~0) &&
-		    rule_copy.table != RT_TABLE_MAIN &&
-		    rule_copy.table != RT_TABLE_LOCAL &&
-		    rule_copy.table != RT_TABLE_DEFAULT &&
-		    rule_copy.table > 100) {
-			filter = true;
-		}
-	}
-
-	if (filter) {
-		data->skb = (struct sk_buff *)regs->regs[0];
-		data->saved_len = data->skb ? data->skb->len : 0;
-		data->should_filter = true;
-		vpnhide_dbg(
-			"fib_rule_fill_entry: hiding policy rule table=%u\n",
-			rule_copy.table);
-	}
-
-	return 0;
+            if (filter) {
+                vpnhide_dbg("fib_nl_fill_rule: hiding policy rule table=%u\n", rule_copy.table);
+                skb_trim(skb, saved_len);
+                ret = 0; /* Report success despite trimming */
+            }
+        }
+    }
+    return ret;
 }
 
-static int fib_rule_fill_ret(struct kretprobe_instance *ri,
-			     struct pt_regs *regs)
-{
-	return route_skb_ret((void *)ri->data, regs, "fib_rule_fill_ret");
-}
+/* ========================================================================= */
+/* MODULE INITIALIZATION                                                     */
+/* ========================================================================= */
 
-static struct kretprobe fib_rule_fill_krp = {
-	.handler = fib_rule_fill_ret,
-	.entry_handler = fib_rule_fill_entry,
-	.data_size = sizeof(struct route_skb_data),
-	.maxactive = VPNHIDE_KRETPROBE_MAXACTIVE,
-	.kp.symbol_name = "fib_nl_fill_rule",
+/*** Kprobes Engine ***/
+
+#ifdef __x86_64__
+    #define PT_REGS_IP(regs) ((regs)->ip)
+    #define MCOUNT_INSN_SIZE 5
+#else
+    #define PT_REGS_IP(regs) ((regs)->pc)
+#endif
+
+struct kprobe_hook {
+    const char *name;
+    void *hook_fn;
+    void *orig_fn;
+    struct kprobe kp;
+    bool registered;
 };
 
-/* ================================================================== */
-/*  Module init / exit                                                */
-/* ================================================================== */
+static struct kprobe_hook hooks[] = {
+    { .name = "dev_ioctl",           .hook_fn = hook_dev_ioctl,           .orig_fn = &orig_dev_ioctl },
+    { .name = "sock_ioctl",          .hook_fn = hook_sock_ioctl,          .orig_fn = &orig_sock_ioctl },
+    { .name = "rtnl_fill_ifinfo",    .hook_fn = hook_rtnl_fill_ifinfo,    .orig_fn = &orig_rtnl_fill_ifinfo },
+    { .name = "inet6_fill_ifaddr",   .hook_fn = hook_inet6_fill_ifaddr,   .orig_fn = &orig_inet6_fill_ifaddr },
+    { .name = "inet_fill_ifaddr",    .hook_fn = hook_inet_fill_ifaddr,    .orig_fn = &orig_inet_fill_ifaddr },
+    { .name = "fib_route_seq_show",  .hook_fn = hook_fib_route_seq_show,  .orig_fn = &orig_fib_route_seq_show },
+    { .name = "ipv6_route_seq_show", .hook_fn = hook_ipv6_route_seq_show, .orig_fn = &orig_ipv6_route_seq_show },
+    { .name = "fib_dump_info",       .hook_fn = hook_fib_dump_info,       .orig_fn = &orig_fib_dump_info },
+    { .name = "rt6_fill_node",       .hook_fn = hook_rt6_fill_node,       .orig_fn = &orig_rt6_fill_node },
+    { .name = "fib_nl_fill_rule",    .hook_fn = hook_fib_nl_fill_rule,    .orig_fn = &orig_fib_nl_fill_rule },
+};
+
+static int notrace kprobe_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    struct kprobe_hook *hook = container_of(p, struct kprobe_hook, kp);
+
+#if defined(__aarch64__)
+    if (p->ainsn.api.insn) *((unsigned long*) hook->orig_fn) = (unsigned long)p->ainsn.api.insn;
+    else *((unsigned long*) hook->orig_fn) = (unsigned long)p->addr + MCOUNT_INSN_SIZE;
+#else
+    if (p->ainsn.insn) *((unsigned long*) hook->orig_fn) = (unsigned long)p->ainsn.insn;
+    else *((unsigned long*) hook->orig_fn) = (unsigned long)p->addr + MCOUNT_INSN_SIZE;
+#endif
+
+    PT_REGS_IP(regs) = (unsigned long)hook->hook_fn;
+    return 1;
+}
+NOKPROBE_SYMBOL(kprobe_pre_handler);
+
+static int register_kprobe_hook(struct kprobe_hook *hook) {
+    int ret;
+    memset(&hook->kp, 0, sizeof(struct kprobe));
+    hook->kp.symbol_name = hook->name;
+    hook->kp.pre_handler = kprobe_pre_handler;
+    ret = register_kprobe(&hook->kp);
+    if (ret == 0) hook->registered = true;
+    return ret;
+}
+
+static void unregister_kprobe_hook(struct kprobe_hook *hook) {
+    if (hook->registered) {
+        unregister_kprobe(&hook->kp);
+        hook->registered = false;
+    }
+}
 
 static struct proc_dir_entry *targets_entry;
 static struct proc_dir_entry *debug_entry;
 
-struct kretprobe_reg {
-	struct kretprobe *krp;
-	const char *name;
-	bool registered;
-};
+static int __init vpnhide_init(void) {
+    int i, ret, ok = 0;
 
-static struct kretprobe_reg probes[] = {
-	{ &dev_ioctl_krp, "dev_ioctl", false },
-	{ &sock_ioctl_krp, "sock_ioctl", false },
-	{ &rtnl_fill_krp, "rtnl_fill_ifinfo", false },
-	{ &inet6_fill_krp, "inet6_fill_ifaddr", false },
-	{ &inet_fill_krp, "inet_fill_ifaddr", false },
-	{ &fib_route_krp, "fib_route_seq_show", false },
-	{ &ipv6_route_krp, "ipv6_route_seq_show", false },
-	{ &fib_dump_krp, "fib_dump_info", false },
-	{ &rt6_fill_krp, "rt6_fill_node", false },
-	{ &fib_rule_fill_krp, "fib_nl_fill_rule", false },
-};
+    for (i = 0; i < ARRAY_SIZE(hooks); i++) {
+        ret = register_kprobe_hook(&hooks[i]);
+        if (ret == 0) ok++;
+        else pr_warn(MODNAME ": hook(%s) failed: %d\n", hooks[i].name, ret);
+    }
 
-static int __init vpnhide_init(void)
-{
-	int i, ret, ok = 0;
+    if (ok == 0) {
+        pr_err(MODNAME ": no hooks registered, aborting\n");
+        return -ENOENT;
+    }
 
-	for (i = 0; i < ARRAY_SIZE(probes); i++) {
-		ret = register_kretprobe(probes[i].krp);
-		if (ret < 0) {
-			pr_warn(MODNAME ": kretprobe(%s) failed: %d\n",
-				probes[i].name, ret);
-		} else {
-			probes[i].registered = true;
-			ok++;
-			pr_info(MODNAME ": kretprobe(%s) registered\n",
-				probes[i].name);
-		}
-	}
+    /* 0600: root-only read/write. Apps must not see the target list. */
+    targets_entry = proc_create("vpnhide_targets", 0600, NULL, &targets_proc_ops);
+    if (!targets_entry) {
+        pr_err(MODNAME ": proc_create(vpnhide_targets) failed; aborting\n");
+        for (i = 0; i < ARRAY_SIZE(hooks); i++) {
+						unregister_kprobe_hook(&hooks[i]);
+				}
+        return -ENOMEM;
+    }
 
-	if (ok == 0) {
-		pr_err(MODNAME ": no kretprobes registered, aborting\n");
-		return -ENOENT;
-	}
-	if (ok < ARRAY_SIZE(probes))
-		pr_warn(MODNAME ": only %d/%zu kretprobes registered — "
-				"some detection paths are not covered\n",
-			ok, ARRAY_SIZE(probes));
+    debug_entry = proc_create("vpnhide_debug", 0600, NULL, &debug_proc_ops);
+    if (!debug_entry) {
+        pr_warn(MODNAME ": proc_create(vpnhide_debug) failed; debug toggle unavailable\n");
+    }
 
-	/* 0600: root-only read/write. UIDs are written here by service.sh
-	 * and the VPN Hide app (both root). Apps must not see the target list. */
-	targets_entry =
-		proc_create("vpnhide_targets", 0600, NULL, &targets_proc_ops);
-	if (!targets_entry) {
-		/* Without /proc/vpnhide_targets userspace cannot configure
-		 * the target UID list, so the module would silently filter
-		 * nothing — fail loudly instead of pretending to work. */
-		pr_err(MODNAME
-		       ": proc_create(vpnhide_targets) failed; aborting\n");
-		for (i = 0; i < ARRAY_SIZE(probes); i++)
-			if (probes[i].registered)
-				unregister_kretprobe(probes[i].krp);
-		return -ENOMEM;
-	}
-	debug_entry = proc_create("vpnhide_debug", 0600, NULL, &debug_proc_ops);
-	if (!debug_entry)
-		pr_warn(MODNAME
-			": proc_create(vpnhide_debug) failed; debug toggle unavailable\n");
-
-	pr_info(MODNAME ": loaded — write UIDs to /proc/vpnhide_targets\n");
-	return 0;
+    pr_info(MODNAME ": loaded - write UIDs to /proc/vpnhide_targets\n");
+    return 0;
 }
 
-static void __exit vpnhide_exit(void)
-{
-	int i;
+static void __exit vpnhide_exit(void) {
+    int i;
 
-	if (debug_entry)
-		proc_remove(debug_entry);
-	if (targets_entry)
-		proc_remove(targets_entry);
+    if (debug_entry) proc_remove(debug_entry);
+    if (targets_entry) proc_remove(targets_entry);
 
-	for (i = 0; i < ARRAY_SIZE(probes); i++) {
-		if (probes[i].registered) {
-			unregister_kretprobe(probes[i].krp);
-			pr_info(MODNAME ": kretprobe(%s) unregistered "
-					"(missed %d)\n",
-				probes[i].name, probes[i].krp->nmissed);
-		}
-	}
-
-	pr_info(MODNAME ": unloaded\n");
+    for (i = 0; i < ARRAY_SIZE(hooks); i++) {
+        unregister_kprobe_hook(&hooks[i]);
+    }
+    pr_info(MODNAME ": unloaded\n");
 }
 
 module_init(vpnhide_init);
@@ -1442,5 +981,5 @@ module_exit(vpnhide_exit);
  * is required to resolve EXPORT_SYMBOL_GPL symbols (kretprobes, etc.)
  * at module load time. */
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("okhsunrog");
+MODULE_AUTHOR("okhsunrog, maxsteeel");
 MODULE_DESCRIPTION("Hide VPN interfaces from selected apps at kernel level");
